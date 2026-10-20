@@ -1,0 +1,17 @@
+[package]
+name = "hyprland-focus"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Live Hyprland window search for anyrun, including daemon mode"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abi_stable = "0.11.3"
+anyrun-plugin = { git = "https://github.com/anyrun-org/anyrun", branch = "master" }
+fuzzy-matcher = "0.3.7"
+hyprland = { git = "https://github.com/hyprland-community/hyprland-rs", rev = "c7037d4ce5c64e7f376a58802b806471792b0993", default-features = false, features = ["data", "dispatch"] }
+ron = "0.10.1"
+serde = { version = "1.0.228", features = ["derive"] }

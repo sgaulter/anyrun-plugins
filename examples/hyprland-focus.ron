@@ -1,0 +1,4 @@
+Config(
+    prefix: ":w ",
+    max_entries: 10,
+)
