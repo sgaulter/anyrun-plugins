@@ -1,0 +1,20 @@
+Config(
+    command: ["xdg-open"],
+    engines: [
+        (
+            name: "GitHub",
+            prefix: "gh",
+            url: "https://github.com/",
+        ),
+        (
+            name: "Kagi",
+            prefix: "?k",
+            url: "https://kagi.com/search?q={}",
+        ),
+        (
+            name: "Glean",
+            prefix: "?g",
+            url: "https://app.glean.com/search?q={}",
+        ),
+    ],
+)

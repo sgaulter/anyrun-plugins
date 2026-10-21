@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["plugins/hyprland-focus"]
+members = ["plugins/hyprland-focus", "plugins/multi-web"]
 
 [workspace.package]
 edition = "2024"
