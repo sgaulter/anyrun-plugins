@@ -131,6 +131,8 @@ fn focus_window(instance: &Instance, id: u64, grouped: bool) -> Result<(), Strin
                 .position(|address| model::parse_address(&address.to_string()) == Some(id))
                 .ok_or_else(|| "Selected window is missing from its group members".to_string())?
                 + 1;
+            // The stable ID selects the group; this index can still become stale
+            // if its members change before the following dispatch.
             let expression = model::group_active_expression(index, &client.stable_id);
             Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
                 .map_err(|e| format!("Could not activate group member with {expression}: {e}"))?;
@@ -193,11 +195,15 @@ fn handler(selection: Match) -> HandleResult {
 mod tests {
     use super::*;
     use std::{
-        io::{Read, Write},
+        io::{self, Read, Write},
         os::unix::net::UnixListener,
-        sync::atomic::{AtomicU64, Ordering},
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     const GROUPED_CLIENT: &str = r#"{
@@ -231,27 +237,74 @@ mod tests {
         ));
         fs::create_dir(&directory).unwrap();
         let listener = UnixListener::bind(directory.join(".socket.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let instance = Instance::from_base_socket_path(directory.clone()).unwrap();
         let exchanges: Vec<_> = exchanges
             .iter()
             .map(|(request, response)| (request.as_bytes().to_vec(), response.as_bytes().to_vec()))
             .collect();
-        let server = thread::spawn(move || {
+        let finished = Arc::new(AtomicBool::new(false));
+        let client_finished = Arc::clone(&finished);
+        let server = thread::spawn(move || -> io::Result<()> {
+            let timeout = Duration::from_secs(5);
             for (request, response) in exchanges {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
+                let deadline = Instant::now() + timeout;
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if client_finished.load(Ordering::Relaxed) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "test client finished before sending an expected request",
+                                ));
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "timed out waiting for a test client connection",
+                                ));
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
                 let mut received = vec![0; request.len()];
-                stream.read_exact(&mut received).unwrap();
+                stream.read_exact(&mut received)?;
                 assert_eq!(received, request);
-                stream.write_all(&response).unwrap();
+                stream.write_all(&response)?;
             }
+            Ok(())
         });
-        let result = call(&instance);
-        server.join().unwrap();
+        // Always stop/join the worker and remove its socket, including on panic.
+        let result = catch_unwind(AssertUnwindSafe(|| call(&instance)));
+        finished.store(true, Ordering::Relaxed);
+        let server_result = server.join();
         fs::remove_dir_all(directory).unwrap();
+        let result = result.unwrap_or_else(|panic| resume_unwind(panic));
+        server_result.unwrap().unwrap();
         result
+    }
+
+    #[test]
+    #[should_panic(expected = "test client finished before sending an expected request")]
+    fn missing_second_request_fails_instead_of_hanging() {
+        let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
+        with_exchanges(&[(focus, "ok"), ("j/clients", "[]")], |instance| {
+            // Deliberately omit the second expected exchange.
+            focus_window(instance, 0xabcd, false)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "test caller failed")]
+    fn caller_panic_stops_worker_and_preserves_original_failure() {
+        with_exchanges(&[("j/clients", "[]")], |_| panic!("test caller failed"));
     }
 
     #[test]
@@ -267,7 +320,8 @@ mod tests {
     #[test]
     fn grouped_window_is_focused_then_activated_by_fresh_index_and_stable_id() {
         let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
-        let activate = "j/dispatch hl.dsp.group.active({index=2, window=\"stableid:test-window-a\"}) ";
+        let activate =
+            "j/dispatch hl.dsp.group.active({index=2, window=\"stableid:test-window-a\"}) ";
         let clients = format!("[{GROUPED_CLIENT}]");
         assert!(
             with_exchanges(
@@ -306,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn group_changes_after_focus_do_not_activate_an_unrelated_tab() {
+    fn missing_window_or_group_data_is_handled_after_focus() {
         let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
         let clients = format!("[{GROUPED_CLIENT}]");
         let missing_stable_id = clients.replace(
