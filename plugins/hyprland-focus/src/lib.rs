@@ -113,9 +113,25 @@ fn focus_window(instance: &Instance, id: u64, grouped: bool) -> Result<(), Strin
     Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
         .map_err(|e| e.to_string())?;
     if grouped {
-        let expression = model::group_active_expression(id);
-        Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
-            .map_err(|e| format!("Could not activate group member: {e}"))?;
+        // Resolve the index after focusing: membership/order may have changed
+        // since the launcher obtained its results.
+        let clients = Clients::instance_get(instance).map_err(|e| e.to_string())?;
+        let clients = clients.to_vec();
+        let client = clients
+            .iter()
+            .find(|client| model::parse_address(&client.address.to_string()) == Some(id))
+            .ok_or_else(|| "Selected window disappeared after focusing".to_string())?;
+        if !client.grouped.is_empty() {
+            let index = client
+                .grouped
+                .iter()
+                .position(|address| model::parse_address(&address.to_string()) == Some(id))
+                .ok_or_else(|| "Selected window is missing from its group members".to_string())?
+                + 1;
+            let expression = model::group_active_expression(index);
+            Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
+                .map_err(|e| format!("Could not activate group member with {expression}: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -181,6 +197,15 @@ mod tests {
         time::Duration,
     };
 
+    const GROUPED_CLIENT: &str = r#"{
+        "address": "0xabcd", "mapped": true, "hidden": true, "visible": false,
+        "at": [0, 0], "size": [800, 600], "workspace": {"id": 1, "name": "1"},
+        "floating": false, "monitor": 0, "class": "foot", "title": "Inactive tab",
+        "initialClass": "foot", "initialTitle": "Inactive tab", "pid": 1,
+        "xwayland": false, "pinned": false, "fullscreen": 0, "fullscreenClient": 0,
+        "grouped": ["0x1234", "0xabcd"], "swallowing": null, "focusHistoryID": 1
+    }"#;
+
     #[test]
     fn partial_configuration_preserves_defaults() {
         let config: Config = ron::from_str("Config(prefix: \"w \")").unwrap();
@@ -236,39 +261,66 @@ mod tests {
     }
 
     #[test]
-    fn grouped_window_is_focused_then_activated_by_address() {
+    fn grouped_window_is_focused_then_activated_by_fresh_index() {
         let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
-        let activate = "j/dispatch hl.dsp.group.active(\"address:0xabcd\") ";
+        let activate = "j/dispatch hl.dsp.group.active(2) ";
+        let clients = format!("[{GROUPED_CLIENT}]");
         assert!(
-            with_exchanges(&[(focus, "ok"), (activate, "ok")], |i| {
-                focus_window(i, 0xabcd, true)
-            })
+            with_exchanges(
+                &[(focus, "ok"), ("j/clients", &clients), (activate, "ok")],
+                |i| { focus_window(i, 0xabcd, true) }
+            )
             .is_ok()
         );
-        let result = with_exchanges(&[(focus, "ok"), (activate, "not in group")], |i| {
-            focus_window(i, 0xabcd, true)
-        });
+        let result = with_exchanges(
+            &[
+                (focus, "ok"),
+                ("j/clients", &clients),
+                (activate, "not in group"),
+            ],
+            |i| focus_window(i, 0xabcd, true),
+        );
         assert!(result.unwrap_err().contains("not in group"));
         let result = with_socket(focus, "window not found", |i| focus_window(i, 0xabcd, true));
         assert!(result.unwrap_err().contains("window not found"));
     }
 
     #[test]
+    fn group_changes_after_focus_do_not_activate_an_unrelated_tab() {
+        let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
+        let clients = format!("[{GROUPED_CLIENT}]");
+        let ungrouped = clients.replace(r#"["0x1234", "0xabcd"]"#, "[]");
+        assert!(
+            with_exchanges(&[(focus, "ok"), ("j/clients", &ungrouped)], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .is_ok()
+        );
+        let invalid = clients.replace(r#"["0x1234", "0xabcd"]"#, r#"["0x1234"]"#);
+        assert!(
+            with_exchanges(&[(focus, "ok"), ("j/clients", &invalid)], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .unwrap_err()
+            .contains("missing from its group")
+        );
+        assert!(
+            with_exchanges(&[(focus, "ok"), ("j/clients", "[]")], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .unwrap_err()
+            .contains("disappeared")
+        );
+    }
+
+    #[test]
     fn hidden_group_members_are_searchable_but_other_hidden_windows_are_not() {
-        let client = r#"{
-            "address": "0xabcd", "mapped": true, "hidden": true, "visible": false,
-            "at": [0, 0], "size": [800, 600], "workspace": {"id": 1, "name": "1"},
-            "floating": false, "monitor": 0, "class": "foot", "title": "Inactive tab",
-            "initialClass": "foot", "initialTitle": "Inactive tab", "pid": 1,
-            "xwayland": false, "pinned": false, "fullscreen": 0, "fullscreenClient": 0,
-            "grouped": ["0xabcd", "0x1234"], "swallowing": null, "focusHistoryID": 1
-        }"#;
-        let response = format!("[{client}]");
+        let response = format!("[{GROUPED_CLIENT}]");
         let windows = with_socket("j/clients", &response, read_windows).unwrap();
         assert_eq!(windows.len(), 1);
         assert!(windows[0].grouped);
         assert_eq!(windows[0].id, 0xabcd);
-        let hidden_ungrouped = response.replace(r#"["0xabcd", "0x1234"]"#, "[]");
+        let hidden_ungrouped = response.replace(r#"["0x1234", "0xabcd"]"#, "[]");
         assert!(
             with_socket("j/clients", &hidden_ungrouped, read_windows)
                 .unwrap()

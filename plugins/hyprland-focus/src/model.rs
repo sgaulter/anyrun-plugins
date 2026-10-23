@@ -82,8 +82,8 @@ pub fn focus_expression(id: u64) -> String {
     format!("hl.dsp.focus({{ window = \"address:0x{id:x}\" }})")
 }
 
-pub fn group_active_expression(id: u64) -> String {
-    format!("hl.dsp.group.active(\"address:0x{id:x}\")")
+pub fn group_active_expression(index: usize) -> String {
+    format!("hl.dsp.group.active({index})")
 }
 
 #[cfg(test)]
