@@ -51,7 +51,7 @@ fn init(config_dir: RString) -> State {
             Config::default()
         }
     };
-    // Do not connect or obtain a client snapshot here: state survives daemon use.
+    // Read live client and group information when querying or selecting a result.
     State { config }
 }
 
@@ -71,9 +71,9 @@ impl Backend for HyprlandBackend {
         read_windows(&instance)
     }
 
-    fn focus(&mut self, id: u64) -> Result<(), String> {
+    fn focus(&mut self, id: u64, grouped: bool) -> Result<(), String> {
         let instance = Instance::from_current_env().map_err(|e| e.to_string())?;
-        focus_window(&instance, id)
+        focus_window(&instance, id, grouped)
     }
 }
 
@@ -83,8 +83,9 @@ fn read_windows(instance: &Instance) -> Result<Vec<Window>, String> {
         .to_vec()
         .into_iter()
         .filter_map(|client| {
-            // Off-workspace windows may be invisible but are still valid targets.
-            if !client.mapped || client.hidden {
+            // Include inactive group tabs and windows on other workspaces.
+            let grouped = !client.grouped.is_empty();
+            if !client.mapped || (client.hidden && !grouped) {
                 return None;
             }
             let address = client.address.to_string();
@@ -98,18 +99,25 @@ fn read_windows(instance: &Instance) -> Result<Vec<Window>, String> {
                 class: client.class,
                 workspace: client.workspace.name,
                 focus_order: i32::from(client.focus_history_id),
+                grouped,
             })
         })
         .collect())
 }
 
-fn focus_window(instance: &Instance, id: u64) -> Result<(), String> {
+fn focus_window(instance: &Instance, id: u64, grouped: bool) -> Result<(), String> {
     let expression = model::focus_expression(id);
     // The bindings' FocusWindow variant still sends the legacy focuswindow
     // command. Custom retains their IPC transport and error handling while
     // allowing Hyprland 0.56's Lua dispatcher. No shell or hyprctl subprocess.
     Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if grouped {
+        let expression = model::group_active_expression(id);
+        Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
+            .map_err(|e| format!("Could not activate group member: {e}"))?;
+    }
+    Ok(())
 }
 
 #[get_matches]
@@ -182,6 +190,10 @@ mod tests {
 
     // Exercises the real Rust binding transport without a running compositor.
     fn with_socket<T>(request: &str, response: &str, call: impl FnOnce(&Instance) -> T) -> T {
+        with_exchanges(&[(request, response)], call)
+    }
+
+    fn with_exchanges<T>(exchanges: &[(&str, &str)], call: impl FnOnce(&Instance) -> T) -> T {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
             "anyrun-hyprland-test-{}-{}",
@@ -191,17 +203,21 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let listener = UnixListener::bind(directory.join(".socket.sock")).unwrap();
         let instance = Instance::from_base_socket_path(directory.clone()).unwrap();
-        let request = request.as_bytes().to_vec();
-        let response = response.as_bytes().to_vec();
+        let exchanges: Vec<_> = exchanges
+            .iter()
+            .map(|(request, response)| (request.as_bytes().to_vec(), response.as_bytes().to_vec()))
+            .collect();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut received = vec![0; request.len()];
-            stream.read_exact(&mut received).unwrap();
-            assert_eq!(received, request);
-            stream.write_all(&response).unwrap();
+            for (request, response) in exchanges {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut received = vec![0; request.len()];
+                stream.read_exact(&mut received).unwrap();
+                assert_eq!(received, request);
+                stream.write_all(&response).unwrap();
+            }
         });
         let result = call(&instance);
         server.join().unwrap();
@@ -212,9 +228,58 @@ mod tests {
     #[test]
     fn rust_bindings_send_lua_focus_and_report_dispatch_errors() {
         let request = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
-        assert!(with_socket(request, "ok", |i| focus_window(i, 0xabcd)).is_ok());
-        let result = with_socket(request, "window not found", |i| focus_window(i, 0xabcd));
+        assert!(with_socket(request, "ok", |i| focus_window(i, 0xabcd, false)).is_ok());
+        let result = with_socket(request, "window not found", |i| {
+            focus_window(i, 0xabcd, false)
+        });
         assert!(result.unwrap_err().contains("window not found"));
+    }
+
+    #[test]
+    fn grouped_window_is_focused_then_activated_by_address() {
+        let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
+        let activate = "j/dispatch hl.dsp.group.active(\"address:0xabcd\") ";
+        assert!(
+            with_exchanges(&[(focus, "ok"), (activate, "ok")], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .is_ok()
+        );
+        let result = with_exchanges(&[(focus, "ok"), (activate, "not in group")], |i| {
+            focus_window(i, 0xabcd, true)
+        });
+        assert!(result.unwrap_err().contains("not in group"));
+        let result = with_socket(focus, "window not found", |i| focus_window(i, 0xabcd, true));
+        assert!(result.unwrap_err().contains("window not found"));
+    }
+
+    #[test]
+    fn hidden_group_members_are_searchable_but_other_hidden_windows_are_not() {
+        let client = r#"{
+            "address": "0xabcd", "mapped": true, "hidden": true, "visible": false,
+            "at": [0, 0], "size": [800, 600], "workspace": {"id": 1, "name": "1"},
+            "floating": false, "monitor": 0, "class": "foot", "title": "Inactive tab",
+            "initialClass": "foot", "initialTitle": "Inactive tab", "pid": 1,
+            "xwayland": false, "pinned": false, "fullscreen": 0, "fullscreenClient": 0,
+            "grouped": ["0xabcd", "0x1234"], "swallowing": null, "focusHistoryID": 1
+        }"#;
+        let response = format!("[{client}]");
+        let windows = with_socket("j/clients", &response, read_windows).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert!(windows[0].grouped);
+        assert_eq!(windows[0].id, 0xabcd);
+        let hidden_ungrouped = response.replace(r#"["0xabcd", "0x1234"]"#, "[]");
+        assert!(
+            with_socket("j/clients", &hidden_ungrouped, read_windows)
+                .unwrap()
+                .is_empty()
+        );
+        let unmapped = response.replace(r#""mapped": true"#, r#""mapped": false"#);
+        assert!(
+            with_socket("j/clients", &unmapped, read_windows)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
