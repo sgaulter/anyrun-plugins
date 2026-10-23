@@ -134,11 +134,14 @@ fn matches(input: &str, config: &Config) -> Vec<Match> {
             }
             let query = input.strip_prefix(&engine.prefix)?.trim();
             let is_search = engine.is_search();
-            if is_search && query.is_empty() {
-                return None;
-            }
+            let needs_query = is_search && query.is_empty();
             Some(Match {
-                title: if is_search { query } else { &engine.name }.into(),
+                title: if is_search && !needs_query {
+                    query
+                } else {
+                    &engine.name
+                }
+                .into(),
                 description: ROption::RSome(if is_search {
                     format!("Search {}", engine.name).into()
                 } else {
@@ -146,7 +149,12 @@ fn matches(input: &str, config: &Config) -> Vec<Match> {
                 }),
                 icon: ROption::RNone,
                 use_pango: false,
-                id: ROption::RSome(index as u64),
+                // Prefix-only search entries are hints, not actionable searches.
+                id: if needs_query {
+                    ROption::RNone
+                } else {
+                    ROption::RSome(index as u64)
+                },
             })
         })
         .collect()
@@ -209,9 +217,31 @@ mod tests {
         assert_eq!(found[0].title.as_str(), "rust async");
         assert_eq!(found[0].id, ROption::RSome(0));
         assert_eq!(matches("?gplanning", &config)[0].id, ROption::RSome(1));
-        for input in ["", "k ", "?g  ", "knowledge", "other query"] {
+        for input in ["", "knowledge", "other query"] {
             assert!(matches(input, &config).is_empty());
         }
+    }
+
+    #[test]
+    fn prefix_only_searches_show_engine_hints_until_query_is_entered() {
+        let config = config();
+        for (input, name) in [
+            ("k ", "Kagi"),
+            ("k   ", "Kagi"),
+            ("?g", "Glean"),
+            ("?g \t", "Glean"),
+        ] {
+            let found = matches(input, &config);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].title.as_str(), name);
+            assert!(selection_url(&found[0], &config).is_none());
+        }
+        // A query equal to the engine name is still a real search.
+        let found = matches("k Kagi", &config);
+        assert_eq!(
+            selection_url(&found[0], &config).as_deref(),
+            Some("https://kagi.com/search?q=Kagi")
+        );
     }
 
     #[test]
@@ -229,7 +259,15 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].id, ROption::RSome(2));
         assert_eq!(found[1].id, ROption::RSome(3));
-        assert!(matches("gh ", &config).is_empty());
+        let hints = matches("gh ", &config);
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].title.as_str(), "Long A");
+        assert_eq!(hints[1].title.as_str(), "Long B");
+        assert!(
+            hints
+                .iter()
+                .all(|hint| selection_url(hint, &config).is_none())
+        );
         assert_eq!(matches("ordinary query", &config)[0].id, ROption::RSome(0));
     }
 
@@ -327,7 +365,7 @@ mod tests {
                 "https://example.org/docs?a=1#intro"
             );
         }
-        assert_eq!(matches("docs", &config).len(), 1);
+        assert_eq!(matches("docs", &config).len(), 2);
         let found = matches("docs rust book", &config);
         assert_eq!(found.len(), 2);
         assert_eq!(
