@@ -83,7 +83,7 @@ pub fn focus_expression(id: u64) -> String {
 }
 
 pub fn group_active_expression(index: usize) -> String {
-    format!("hl.dsp.group.active({index})")
+    format!("hl.dsp.group.active({{{index}}})")
 }
 
 #[cfg(test)]

@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn grouped_window_is_focused_then_activated_by_fresh_index() {
         let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
-        let activate = "j/dispatch hl.dsp.group.active(2) ";
+        let activate = "j/dispatch hl.dsp.group.active({2}) ";
         let clients = format!("[{GROUPED_CLIENT}]");
         assert!(
             with_exchanges(
