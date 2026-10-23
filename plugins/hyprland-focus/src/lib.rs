@@ -113,7 +113,7 @@ fn focus_window(instance: &Instance, id: u64, grouped: bool) -> Result<(), Strin
     Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
         .map_err(|e| e.to_string())?;
     if grouped {
-        // Resolve the index after focusing: membership/order may have changed
+        // Resolve the stable ID and index after focusing: membership/order may have changed
         // since the launcher obtained its results.
         let clients = Clients::instance_get(instance).map_err(|e| e.to_string())?;
         let clients = clients.to_vec();
@@ -122,13 +122,16 @@ fn focus_window(instance: &Instance, id: u64, grouped: bool) -> Result<(), Strin
             .find(|client| model::parse_address(&client.address.to_string()) == Some(id))
             .ok_or_else(|| "Selected window disappeared after focusing".to_string())?;
         if !client.grouped.is_empty() {
+            if client.stable_id.is_empty() {
+                return Err("Selected group member has no stableId".into());
+            }
             let index = client
                 .grouped
                 .iter()
                 .position(|address| model::parse_address(&address.to_string()) == Some(id))
                 .ok_or_else(|| "Selected window is missing from its group members".to_string())?
                 + 1;
-            let expression = model::group_active_expression(index);
+            let expression = model::group_active_expression(index, &client.stable_id);
             Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
                 .map_err(|e| format!("Could not activate group member with {expression}: {e}"))?;
         }
@@ -203,7 +206,8 @@ mod tests {
         "floating": false, "monitor": 0, "class": "foot", "title": "Inactive tab",
         "initialClass": "foot", "initialTitle": "Inactive tab", "pid": 1,
         "xwayland": false, "pinned": false, "fullscreen": 0, "fullscreenClient": 0,
-        "grouped": ["0x1234", "0xabcd"], "swallowing": null, "focusHistoryID": 1
+        "grouped": ["0x1234", "0xabcd"], "swallowing": null, "focusHistoryID": 1,
+        "stableId": "test-window-a"
     }"#;
 
     #[test]
@@ -261,14 +265,30 @@ mod tests {
     }
 
     #[test]
-    fn grouped_window_is_focused_then_activated_by_fresh_index() {
+    fn grouped_window_is_focused_then_activated_by_fresh_index_and_stable_id() {
         let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
-        let activate = "j/dispatch hl.dsp.group.active({2}) ";
+        let activate = "j/dispatch hl.dsp.group.active({index=2, window=\"stableid:test-window-a\"}) ";
         let clients = format!("[{GROUPED_CLIENT}]");
         assert!(
             with_exchanges(
                 &[(focus, "ok"), ("j/clients", &clients), (activate, "ok")],
                 |i| { focus_window(i, 0xabcd, true) }
+            )
+            .is_ok()
+        );
+        let changed = clients
+            .replace(r#"["0x1234", "0xabcd"]"#, r#"["0xabcd", "0x1234"]"#)
+            .replace("test-window-a", "test-window-b");
+        let activate_changed =
+            "j/dispatch hl.dsp.group.active({index=1, window=\"stableid:test-window-b\"}) ";
+        assert!(
+            with_exchanges(
+                &[
+                    (focus, "ok"),
+                    ("j/clients", &changed),
+                    (activate_changed, "ok")
+                ],
+                |i| focus_window(i, 0xabcd, true)
             )
             .is_ok()
         );
@@ -289,6 +309,18 @@ mod tests {
     fn group_changes_after_focus_do_not_activate_an_unrelated_tab() {
         let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
         let clients = format!("[{GROUPED_CLIENT}]");
+        let missing_stable_id = clients.replace(
+            r#",
+        "stableId": "test-window-a""#,
+            "",
+        );
+        assert!(
+            with_exchanges(&[(focus, "ok"), ("j/clients", &missing_stable_id)], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .unwrap_err()
+            .contains("no stableId")
+        );
         let ungrouped = clients.replace(r#"["0x1234", "0xabcd"]"#, "[]");
         assert!(
             with_exchanges(&[(focus, "ok"), ("j/clients", &ungrouped)], |i| {

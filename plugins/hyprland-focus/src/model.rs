@@ -82,8 +82,19 @@ pub fn focus_expression(id: u64) -> String {
     format!("hl.dsp.focus({{ window = \"address:0x{id:x}\" }})")
 }
 
-pub fn group_active_expression(index: usize) -> String {
-    format!("hl.dsp.group.active({{{index}}})")
+pub fn group_active_expression(index: usize, stable_id: &str) -> String {
+    use std::fmt::Write;
+    // Stable IDs are opaque strings: escape them as Lua string contents.
+    let mut selector = String::from("\"stableid:");
+    for byte in stable_id.bytes() {
+        if (b' '..=b'~').contains(&byte) && byte != b'"' && byte != b'\\' {
+            selector.push(char::from(byte));
+        } else {
+            write!(selector, "\\{byte:03}").unwrap();
+        }
+    }
+    selector.push('"');
+    format!("hl.dsp.group.active({{index={index}, window={selector}}})")
 }
 
 #[cfg(test)]
@@ -118,7 +129,7 @@ mod tests {
             id,
             title: title.into(),
             class: class.into(),
-            workspace: "2: msg".into(),
+            workspace: "2: test".into(),
             focus_order: order,
             grouped: false,
         }
@@ -241,6 +252,14 @@ mod tests {
         backend.windows[0].grouped = false;
         activate(&mut backend, displayed[0].id).unwrap();
         assert_eq!(backend.focused, vec![(1, true), (1, false)]);
+    }
+
+    #[test]
+    fn group_selector_escapes_opaque_stable_ids() {
+        assert_eq!(
+            group_active_expression(2, "test-window-a\"\\\n"),
+            r#"hl.dsp.group.active({index=2, window="stableid:test-window-a\034\092\010"})"#
+        );
     }
 
     #[test]
