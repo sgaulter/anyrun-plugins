@@ -7,11 +7,12 @@ pub struct Window {
     pub class: String,
     pub workspace: String,
     pub focus_order: i32,
+    pub grouped: bool,
 }
 
 pub trait Backend {
     fn windows(&mut self) -> Result<Vec<Window>, String>;
-    fn focus(&mut self, id: u64) -> Result<(), String>;
+    fn focus(&mut self, id: u64, grouped: bool) -> Result<(), String>;
 }
 
 pub fn search(
@@ -63,10 +64,11 @@ fn focus_order(window: &Window) -> i32 {
 
 pub fn activate(backend: &mut impl Backend, id: u64) -> Result<(), String> {
     // The selected window might have closed since the displayed search results.
-    if !backend.windows()?.iter().any(|window| window.id == id) {
+    let windows = backend.windows()?;
+    let Some(window) = windows.iter().find(|window| window.id == id) else {
         return Err("Selected window has closed or is no longer available".into());
-    }
-    backend.focus(id)
+    };
+    backend.focus(id, window.grouped)
 }
 
 pub fn parse_address(address: &str) -> Option<u64> {
@@ -80,6 +82,21 @@ pub fn focus_expression(id: u64) -> String {
     format!("hl.dsp.focus({{ window = \"address:0x{id:x}\" }})")
 }
 
+pub fn group_active_expression(index: usize, stable_id: &str) -> String {
+    use std::fmt::Write;
+    // Stable IDs are opaque strings: escape them as Lua string contents.
+    let mut selector = String::from("\"stableid:");
+    for byte in stable_id.bytes() {
+        if (b' '..=b'~').contains(&byte) && byte != b'"' && byte != b'\\' {
+            selector.push(char::from(byte));
+        } else {
+            write!(selector, "\\{byte:03}").unwrap();
+        }
+    }
+    selector.push('"');
+    format!("hl.dsp.group.active({{index={index}, window={selector}}})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,7 +105,7 @@ mod tests {
     struct FakeBackend {
         windows: Vec<Window>,
         calls: usize,
-        focused: Vec<u64>,
+        focused: Vec<(u64, bool)>,
         fail: bool,
     }
 
@@ -101,8 +118,8 @@ mod tests {
                 Ok(self.windows.clone())
             }
         }
-        fn focus(&mut self, id: u64) -> Result<(), String> {
-            self.focused.push(id);
+        fn focus(&mut self, id: u64, grouped: bool) -> Result<(), String> {
+            self.focused.push((id, grouped));
             Ok(())
         }
     }
@@ -112,8 +129,9 @@ mod tests {
             id,
             title: title.into(),
             class: class.into(),
-            workspace: "2: msg".into(),
+            workspace: "2: test".into(),
             focus_order: order,
+            grouped: false,
         }
     }
 
@@ -216,10 +234,32 @@ mod tests {
             ..Default::default()
         };
         activate(&mut backend, 1).unwrap();
-        assert_eq!(backend.focused, vec![1]);
+        assert_eq!(backend.focused, vec![(1, false)]);
         backend.windows.retain(|w| w.id != 1);
         assert!(activate(&mut backend, 1).is_err());
-        assert_eq!(backend.focused, vec![1]);
+        assert_eq!(backend.focused, vec![(1, false)]);
+    }
+
+    #[test]
+    fn activation_uses_current_group_membership() {
+        let mut backend = FakeBackend {
+            windows: vec![window(1, "tab", "foot", 0)],
+            ..Default::default()
+        };
+        let displayed = search(&mut backend, "", "", 10, contains).unwrap();
+        backend.windows[0].grouped = true;
+        activate(&mut backend, displayed[0].id).unwrap();
+        backend.windows[0].grouped = false;
+        activate(&mut backend, displayed[0].id).unwrap();
+        assert_eq!(backend.focused, vec![(1, true), (1, false)]);
+    }
+
+    #[test]
+    fn group_selector_escapes_opaque_stable_ids() {
+        assert_eq!(
+            group_active_expression(2, "test-window-a\"\\\n"),
+            r#"hl.dsp.group.active({index=2, window="stableid:test-window-a\034\092\010"})"#
+        );
     }
 
     #[test]

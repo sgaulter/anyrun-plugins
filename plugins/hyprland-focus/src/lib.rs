@@ -51,7 +51,7 @@ fn init(config_dir: RString) -> State {
             Config::default()
         }
     };
-    // Do not connect or obtain a client snapshot here: state survives daemon use.
+    // Read live client and group information when querying or selecting a result.
     State { config }
 }
 
@@ -71,9 +71,9 @@ impl Backend for HyprlandBackend {
         read_windows(&instance)
     }
 
-    fn focus(&mut self, id: u64) -> Result<(), String> {
+    fn focus(&mut self, id: u64, grouped: bool) -> Result<(), String> {
         let instance = Instance::from_current_env().map_err(|e| e.to_string())?;
-        focus_window(&instance, id)
+        focus_window(&instance, id, grouped)
     }
 }
 
@@ -83,8 +83,9 @@ fn read_windows(instance: &Instance) -> Result<Vec<Window>, String> {
         .to_vec()
         .into_iter()
         .filter_map(|client| {
-            // Off-workspace windows may be invisible but are still valid targets.
-            if !client.mapped || client.hidden {
+            // Include inactive group tabs and windows on other workspaces.
+            let grouped = !client.grouped.is_empty();
+            if !client.mapped || (client.hidden && !grouped) {
                 return None;
             }
             let address = client.address.to_string();
@@ -98,18 +99,46 @@ fn read_windows(instance: &Instance) -> Result<Vec<Window>, String> {
                 class: client.class,
                 workspace: client.workspace.name,
                 focus_order: i32::from(client.focus_history_id),
+                grouped,
             })
         })
         .collect())
 }
 
-fn focus_window(instance: &Instance, id: u64) -> Result<(), String> {
+fn focus_window(instance: &Instance, id: u64, grouped: bool) -> Result<(), String> {
     let expression = model::focus_expression(id);
     // The bindings' FocusWindow variant still sends the legacy focuswindow
     // command. Custom retains their IPC transport and error handling while
     // allowing Hyprland 0.56's Lua dispatcher. No shell or hyprctl subprocess.
     Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if grouped {
+        // Resolve the stable ID and index after focusing: membership/order may have changed
+        // since the launcher obtained its results.
+        let clients = Clients::instance_get(instance).map_err(|e| e.to_string())?;
+        let clients = clients.to_vec();
+        let client = clients
+            .iter()
+            .find(|client| model::parse_address(&client.address.to_string()) == Some(id))
+            .ok_or_else(|| "Selected window disappeared after focusing".to_string())?;
+        if !client.grouped.is_empty() {
+            if client.stable_id.is_empty() {
+                return Err("Selected group member has no stableId".into());
+            }
+            let index = client
+                .grouped
+                .iter()
+                .position(|address| model::parse_address(&address.to_string()) == Some(id))
+                .ok_or_else(|| "Selected window is missing from its group members".to_string())?
+                + 1;
+            // The stable ID selects the group; this index can still become stale
+            // if its members change before the following dispatch.
+            let expression = model::group_active_expression(index, &client.stable_id);
+            Dispatch::instance_call(instance, DispatchType::Custom(&expression, ""))
+                .map_err(|e| format!("Could not activate group member with {expression}: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[get_matches]
@@ -166,12 +195,26 @@ fn handler(selection: Match) -> HandleResult {
 mod tests {
     use super::*;
     use std::{
-        io::{Read, Write},
+        io::{self, Read, Write},
         os::unix::net::UnixListener,
-        sync::atomic::{AtomicU64, Ordering},
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
+
+    const GROUPED_CLIENT: &str = r#"{
+        "address": "0xabcd", "mapped": true, "hidden": true, "visible": false,
+        "at": [0, 0], "size": [800, 600], "workspace": {"id": 1, "name": "1"},
+        "floating": false, "monitor": 0, "class": "foot", "title": "Inactive tab",
+        "initialClass": "foot", "initialTitle": "Inactive tab", "pid": 1,
+        "xwayland": false, "pinned": false, "fullscreen": 0, "fullscreenClient": 0,
+        "grouped": ["0x1234", "0xabcd"], "swallowing": null, "focusHistoryID": 1,
+        "stableId": "test-window-a"
+    }"#;
 
     #[test]
     fn partial_configuration_preserves_defaults() {
@@ -182,6 +225,10 @@ mod tests {
 
     // Exercises the real Rust binding transport without a running compositor.
     fn with_socket<T>(request: &str, response: &str, call: impl FnOnce(&Instance) -> T) -> T {
+        with_exchanges(&[(request, response)], call)
+    }
+
+    fn with_exchanges<T>(exchanges: &[(&str, &str)], call: impl FnOnce(&Instance) -> T) -> T {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
             "anyrun-hyprland-test-{}-{}",
@@ -190,31 +237,187 @@ mod tests {
         ));
         fs::create_dir(&directory).unwrap();
         let listener = UnixListener::bind(directory.join(".socket.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let instance = Instance::from_base_socket_path(directory.clone()).unwrap();
-        let request = request.as_bytes().to_vec();
-        let response = response.as_bytes().to_vec();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut received = vec![0; request.len()];
-            stream.read_exact(&mut received).unwrap();
-            assert_eq!(received, request);
-            stream.write_all(&response).unwrap();
+        let exchanges: Vec<_> = exchanges
+            .iter()
+            .map(|(request, response)| (request.as_bytes().to_vec(), response.as_bytes().to_vec()))
+            .collect();
+        let finished = Arc::new(AtomicBool::new(false));
+        let client_finished = Arc::clone(&finished);
+        let server = thread::spawn(move || -> io::Result<()> {
+            let timeout = Duration::from_secs(5);
+            for (request, response) in exchanges {
+                let deadline = Instant::now() + timeout;
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if client_finished.load(Ordering::Relaxed) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "test client finished before sending an expected request",
+                                ));
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "timed out waiting for a test client connection",
+                                ));
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+                let mut received = vec![0; request.len()];
+                stream.read_exact(&mut received)?;
+                assert_eq!(received, request);
+                stream.write_all(&response)?;
+            }
+            Ok(())
         });
-        let result = call(&instance);
-        server.join().unwrap();
+        // Always stop/join the worker and remove its socket, including on panic.
+        let result = catch_unwind(AssertUnwindSafe(|| call(&instance)));
+        finished.store(true, Ordering::Relaxed);
+        let server_result = server.join();
         fs::remove_dir_all(directory).unwrap();
+        let result = result.unwrap_or_else(|panic| resume_unwind(panic));
+        server_result.unwrap().unwrap();
         result
+    }
+
+    #[test]
+    #[should_panic(expected = "test client finished before sending an expected request")]
+    fn missing_second_request_fails_instead_of_hanging() {
+        let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
+        with_exchanges(&[(focus, "ok"), ("j/clients", "[]")], |instance| {
+            // Deliberately omit the second expected exchange.
+            focus_window(instance, 0xabcd, false)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "test caller failed")]
+    fn caller_panic_stops_worker_and_preserves_original_failure() {
+        with_exchanges(&[("j/clients", "[]")], |_| panic!("test caller failed"));
     }
 
     #[test]
     fn rust_bindings_send_lua_focus_and_report_dispatch_errors() {
         let request = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
-        assert!(with_socket(request, "ok", |i| focus_window(i, 0xabcd)).is_ok());
-        let result = with_socket(request, "window not found", |i| focus_window(i, 0xabcd));
+        assert!(with_socket(request, "ok", |i| focus_window(i, 0xabcd, false)).is_ok());
+        let result = with_socket(request, "window not found", |i| {
+            focus_window(i, 0xabcd, false)
+        });
         assert!(result.unwrap_err().contains("window not found"));
+    }
+
+    #[test]
+    fn grouped_window_is_focused_then_activated_by_fresh_index_and_stable_id() {
+        let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
+        let activate =
+            "j/dispatch hl.dsp.group.active({index=2, window=\"stableid:test-window-a\"}) ";
+        let clients = format!("[{GROUPED_CLIENT}]");
+        assert!(
+            with_exchanges(
+                &[(focus, "ok"), ("j/clients", &clients), (activate, "ok")],
+                |i| { focus_window(i, 0xabcd, true) }
+            )
+            .is_ok()
+        );
+        let changed = clients
+            .replace(r#"["0x1234", "0xabcd"]"#, r#"["0xabcd", "0x1234"]"#)
+            .replace("test-window-a", "test-window-b");
+        let activate_changed =
+            "j/dispatch hl.dsp.group.active({index=1, window=\"stableid:test-window-b\"}) ";
+        assert!(
+            with_exchanges(
+                &[
+                    (focus, "ok"),
+                    ("j/clients", &changed),
+                    (activate_changed, "ok")
+                ],
+                |i| focus_window(i, 0xabcd, true)
+            )
+            .is_ok()
+        );
+        let result = with_exchanges(
+            &[
+                (focus, "ok"),
+                ("j/clients", &clients),
+                (activate, "not in group"),
+            ],
+            |i| focus_window(i, 0xabcd, true),
+        );
+        assert!(result.unwrap_err().contains("not in group"));
+        let result = with_socket(focus, "window not found", |i| focus_window(i, 0xabcd, true));
+        assert!(result.unwrap_err().contains("window not found"));
+    }
+
+    #[test]
+    fn missing_window_or_group_data_is_handled_after_focus() {
+        let focus = "j/dispatch hl.dsp.focus({ window = \"address:0xabcd\" }) ";
+        let clients = format!("[{GROUPED_CLIENT}]");
+        let missing_stable_id = clients.replace(
+            r#",
+        "stableId": "test-window-a""#,
+            "",
+        );
+        assert!(
+            with_exchanges(&[(focus, "ok"), ("j/clients", &missing_stable_id)], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .unwrap_err()
+            .contains("no stableId")
+        );
+        let ungrouped = clients.replace(r#"["0x1234", "0xabcd"]"#, "[]");
+        assert!(
+            with_exchanges(&[(focus, "ok"), ("j/clients", &ungrouped)], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .is_ok()
+        );
+        let invalid = clients.replace(r#"["0x1234", "0xabcd"]"#, r#"["0x1234"]"#);
+        assert!(
+            with_exchanges(&[(focus, "ok"), ("j/clients", &invalid)], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .unwrap_err()
+            .contains("missing from its group")
+        );
+        assert!(
+            with_exchanges(&[(focus, "ok"), ("j/clients", "[]")], |i| {
+                focus_window(i, 0xabcd, true)
+            })
+            .unwrap_err()
+            .contains("disappeared")
+        );
+    }
+
+    #[test]
+    fn hidden_group_members_are_searchable_but_other_hidden_windows_are_not() {
+        let response = format!("[{GROUPED_CLIENT}]");
+        let windows = with_socket("j/clients", &response, read_windows).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert!(windows[0].grouped);
+        assert_eq!(windows[0].id, 0xabcd);
+        let hidden_ungrouped = response.replace(r#"["0x1234", "0xabcd"]"#, "[]");
+        assert!(
+            with_socket("j/clients", &hidden_ungrouped, read_windows)
+                .unwrap()
+                .is_empty()
+        );
+        let unmapped = response.replace(r#""mapped": true"#, r#""mapped": false"#);
+        assert!(
+            with_socket("j/clients", &unmapped, read_windows)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
